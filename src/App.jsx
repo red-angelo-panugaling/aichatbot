@@ -2,29 +2,36 @@ import { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   Bot,
+  ChevronDown,
+  FileText,
   GraduationCap,
   RotateCcw,
   Send,
   User,
 } from 'lucide-react';
 
-const welcomeMessage = {
+const welcomeMessage = name => ({
   role: 'model',
-  text: 'Hello! Ask me about the reference PDF. I will answer using that document.',
+  text: `Hello! Ask me about ${name}. I will answer using that document.`,
   isWelcome: true,
-};
+});
 
 const quickPrompts = [
-  'Summarize the PDF in 5 points',
-  'What are the main policies?',
+  'Summarize this PDF in 5 points',
+  'What are the main topics?',
   'What questions can this PDF answer?',
 ];
 
 export default function CampusChatbot() {
+  const [documents, setDocuments] = useState([]);
+  const [limits, setLimits] = useState({ maxPages: 400, maxSizeMb: 10 });
+  const [selectedDocument, setSelectedDocument] = useState('');
+  const [isLoadingDocuments, setIsLoadingDocuments] = useState(true);
+  const [documentsError, setDocumentsError] = useState('');
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [messages, setMessages] = useState([welcomeMessage]);
+  const [messages, setMessages] = useState([welcomeMessage('the campus handbook')]);
   const sendingRef = useRef(false);
   const messagesEndRef = useRef(null);
 
@@ -32,9 +39,45 @@ export default function CampusChatbot() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading]);
 
+  useEffect(() => {
+    fetch('/api/documents')
+      .then(async response => {
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          throw new Error(`PDF list service returned HTTP ${response.status}. Restart the dev server and try again.`);
+        }
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Unable to load PDFs.');
+        const availableDocuments = data.documents || [];
+        setDocuments(availableDocuments);
+        if (data.limits) setLimits(data.limits);
+        if (availableDocuments.length) {
+          const initialDocument = availableDocuments.find(item => item.name === 'campus-handbook.pdf')
+            || availableDocuments[0];
+          setSelectedDocument(initialDocument.name);
+          setMessages([welcomeMessage(initialDocument.name)]);
+        } else {
+          setDocumentsError('No PDF files found in the documents folder.');
+        }
+      })
+      .catch(err => setDocumentsError(err.message || 'Unable to load PDFs.'))
+      .finally(() => setIsLoadingDocuments(false));
+  }, []);
+
+  const documentName = selectedDocument;
+  const selectedPdf = documents.find(pdf => pdf.name === selectedDocument);
+  const selectedPdfTooLong = Boolean(selectedPdf?.tooLong);
+
+  const switchDocument = name => {
+    if (sendingRef.current) return;
+    setSelectedDocument(name);
+    setMessages([welcomeMessage(name)]);
+    setError(null);
+  };
+
   const handleSend = async customText => {
     const question = (customText ?? input).trim();
-    if (!question || sendingRef.current) return;
+    if (!question || sendingRef.current || selectedPdfTooLong) return;
 
     sendingRef.current = true;
     setError(null);
@@ -43,7 +86,7 @@ export default function CampusChatbot() {
     // Do not send the synthetic greeting as chat history.
     const history = messages
       .filter(message => !message.isWelcome)
-      .slice(-10)
+      .slice(-12)
       .map(({ role, text }) => ({ role, text }));
 
     setMessages(previous => [...previous, { role: 'user', text: question }]);
@@ -53,7 +96,8 @@ export default function CampusChatbot() {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: question, history }),
+        body: JSON.stringify({ message: question, history, document: selectedDocument }),
+        signal: AbortSignal.timeout(180_000),
       });
 
       const data = await response.json().catch(() => ({}));
@@ -65,7 +109,9 @@ export default function CampusChatbot() {
       }
       setMessages(previous => [...previous, { role: 'model', text: data.reply }]);
     } catch (err) {
-      setError(err.message || 'Unable to connect to the chatbot.');
+      setError(err.name === 'TimeoutError'
+        ? 'The PDF is taking too long to process. Please try your question again.'
+        : err.message || 'Unable to connect to the chatbot.');
       setMessages(previous => previous.slice(0, -1));
       setInput(question);
     } finally {
@@ -76,13 +122,16 @@ export default function CampusChatbot() {
 
   const resetChat = () => {
     if (sendingRef.current) return;
-    setMessages([welcomeMessage]);
+    setMessages([welcomeMessage(documentName)]);
     setInput('');
     setError(null);
   };
 
   const handleKeyDown = event => {
-    if (event.key === 'Enter') handleSend();
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      handleSend();
+    }
   };
 
   return (
@@ -107,11 +156,51 @@ export default function CampusChatbot() {
       <main className="flex-1 overflow-y-auto p-4 md:p-6">
         <div className="mx-auto max-w-3xl space-y-5">
           <div className="rounded-xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm text-indigo-900">
-            <p className="font-semibold">PDF-powered assistant</p>
+            <p className="font-semibold">PDF assistant</p>
             <p className="mt-1 text-xs text-indigo-700">
-              Answers are generated from the PDF configured in the backend. Please verify important details against the document.
+              Ask your own questions or follow up naturally. Answers use the selected PDF as their source.
             </p>
           </div>
+
+          <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="mb-2.5 flex items-center justify-between gap-3">
+              <label htmlFor="pdf-choice" className="text-sm font-semibold text-slate-800">Choose a reference PDF</label>
+              <span className="text-xs text-slate-500">{documents.length} available</span>
+            </div>
+            <div className="relative">
+              <FileText className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-indigo-600" />
+              <select
+                id="pdf-choice"
+                value={selectedDocument}
+                disabled={isLoadingDocuments || isLoading || documents.length === 0}
+                onChange={event => switchDocument(event.target.value)}
+                className="w-full appearance-none rounded-lg border border-slate-300 bg-slate-50 py-2.5 pl-10 pr-10 text-sm font-medium text-slate-800 outline-none transition hover:border-indigo-300 focus:border-indigo-500 focus:bg-white focus:ring-4 focus:ring-indigo-100 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                <option value="" disabled>
+                  {isLoadingDocuments ? 'Loading PDFs…' : documents.length ? 'Select a PDF' : 'No PDFs available'}
+                </option>
+                {documents.map(document => (
+                  <option key={document.name} value={document.name}>
+                    {document.name.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ')}
+                    {document.pages !== null ? ` · ${document.pages} pages` : ''}
+                    {document.tooLong ? ' · over limit' : ''}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+            </div>
+            {documentsError && (
+              <p role="alert" className="mt-2 text-xs text-red-600">{documentsError}</p>
+            )}
+            {selectedPdfTooLong && (
+              <p role="alert" className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-relaxed text-amber-900">
+                This PDF is too long to use. The chatbot limit is {limits.maxPages} pages or {limits.maxSizeMb} MB. Choose a shorter PDF from the list.
+              </p>
+            )}
+            {selectedDocument && !documentsError && !selectedPdfTooLong && (
+              <p className="mt-2 text-xs text-slate-500">Chat answers will use <span className="font-medium text-slate-700">{selectedDocument}</span>.</p>
+            )}
+          </section>
 
           <div className="space-y-4 pt-2">
             {messages.map((message, index) => {
@@ -150,7 +239,7 @@ export default function CampusChatbot() {
                   <span className="h-2 w-2 animate-bounce rounded-full bg-indigo-500" />
                   <span className="h-2 w-2 animate-bounce rounded-full bg-indigo-500 [animation-delay:0.2s]" />
                   <span className="h-2 w-2 animate-bounce rounded-full bg-indigo-500 [animation-delay:0.4s]" />
-                  <span className="ml-2 text-xs font-medium text-slate-400">Generating a response...</span>
+                  <span className="ml-2 text-xs font-medium text-slate-400">Reading the PDF and generating a response...</span>
                 </div>
               </div>
             )}
@@ -174,7 +263,7 @@ export default function CampusChatbot() {
               key={prompt}
               type="button"
               onClick={() => handleSend(prompt)}
-              disabled={isLoading}
+              disabled={isLoading || !selectedDocument || selectedPdfTooLong}
               className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-600 transition hover:border-indigo-400 hover:text-indigo-600 disabled:opacity-50"
             >
               {prompt}
@@ -185,20 +274,21 @@ export default function CampusChatbot() {
 
       <footer className="border-t border-slate-200 bg-white p-4">
         <div className="mx-auto flex max-w-3xl items-center gap-2">
-          <input
-            type="text"
+          <textarea
+            rows={1}
+            maxLength={1000}
             value={input}
             onChange={event => setInput(event.target.value)}
             onKeyDown={handleKeyDown}
-            disabled={isLoading}
-            placeholder="Ask a question about the PDF..."
+            disabled={isLoading || !selectedDocument || selectedPdfTooLong}
+            placeholder={selectedPdfTooLong ? 'This PDF exceeds the chatbot limit. Choose another PDF.' : selectedDocument ? 'Ask anything about the PDF. Follow-up questions are welcome…' : 'Choose a PDF to start chatting...'}
             aria-label="Ask a question about the PDF"
-            className="flex-1 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-800 placeholder-slate-400 transition focus:border-indigo-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-100 disabled:opacity-50"
+            className="min-h-11 flex-1 resize-none rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-800 placeholder-slate-400 transition focus:border-indigo-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-100 disabled:opacity-50"
           />
           <button
             type="button"
             onClick={() => handleSend()}
-            disabled={isLoading || !input.trim()}
+            disabled={isLoading || !selectedDocument || selectedPdfTooLong || !input.trim()}
             className="flex h-11 w-11 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-md shadow-indigo-100 transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-40"
             aria-label="Send message"
           >
@@ -206,7 +296,7 @@ export default function CampusChatbot() {
           </button>
         </div>
         <p className="mt-2 text-center text-[11px] text-slate-400">
-          Responses are generated from the reference PDF configured on the server.
+            Responses are generated from {documentName}.
         </p>
       </footer>
     </div>
